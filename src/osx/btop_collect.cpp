@@ -581,11 +581,246 @@ namespace Gpu {
 		template bool collect<false>(gpu_info*);
 	} // namespace AppleSilicon
 
-	//? Collect data from Apple Silicon GPU
+	//? AMD discrete GPU data collection via IOKit IORegistry
+	namespace AppleAMD {
+		bool initialized = false;
+		unsigned int device_count = 0;
+		unsigned int gpu_index_offset = 0; // offset into gpus[] if AppleSilicon GPUs come first
+
+		//? IOKit service handle for the AMD accelerator
+		io_service_t gpu_service = 0;
+
+		//? Helper: extract an integer from a CFDictionary by key
+		static long long cf_dict_get_int(CFDictionaryRef dict, CFStringRef key) {
+			CFTypeRef val = CFDictionaryGetValue(dict, key);
+			if (not val) return -1;
+			if (CFGetTypeID(val) == CFNumberGetTypeID()) {
+				long long result = 0;
+				CFNumberGetValue((CFNumberRef)val, kCFNumberLongLongType, &result);
+				return result;
+			}
+			return -1;
+		}
+
+		//? Get GPU marketing name via system_profiler (cached)
+		static string get_gpu_name() {
+			static string cached_name;
+			if (not cached_name.empty()) return cached_name;
+
+			char buf[256];
+			FILE* fp = popen("system_profiler SPDisplaysDataType 2>/dev/null", "r");
+			if (fp) {
+				while (fgets(buf, sizeof(buf), fp)) {
+					string line(buf);
+					auto pos = line.find("Chipset Model:");
+					if (pos != string::npos) {
+						cached_name = line.substr(pos + 14);
+						// trim whitespace
+						auto start = cached_name.find_first_not_of(" \t\n\r");
+						auto end = cached_name.find_last_not_of(" \t\n\r");
+						if (start != string::npos)
+							cached_name = cached_name.substr(start, end - start + 1);
+						break;
+					}
+				}
+				pclose(fp);
+			}
+			if (cached_name.empty()) cached_name = "AMD GPU";
+			return cached_name;
+		}
+
+		bool init() {
+			if (initialized) return false;
+
+			//? Search for AMD GPU accelerator in IORegistry
+			io_iterator_t iter_raw;
+			CFMutableDictionaryRef match = IOServiceMatching("IOAccelerator");
+			if (not match) return false;
+
+			if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &iter_raw) != kIOReturnSuccess)
+				return false;
+			IORef iter(iter_raw);
+
+			io_object_t entry_raw;
+			while ((entry_raw = IOIteratorNext(iter)) != 0) {
+				io_name_t class_name;
+				IOObjectGetClass(entry_raw, class_name);
+				string cls(class_name);
+
+				//? Match any AMD Radeon accelerator class
+				if (cls.find("AMDRadeon") != string::npos) {
+					gpu_service = entry_raw; // keep the reference
+					break;
+				}
+				IOObjectRelease(entry_raw);
+			}
+
+			if (not gpu_service) {
+				Logger::info("AppleAMD GPU: No AMD Radeon GPU found in IORegistry");
+				return false;
+			}
+
+			device_count = 1;
+			gpu_index_offset = static_cast<unsigned int>(gpus.size());
+			gpus.resize(gpus.size() + device_count);
+			gpu_names.resize(gpu_names.size() + device_count);
+
+			//? Set device name
+			gpu_names[gpu_index_offset] = get_gpu_name();
+
+			//? Read VRAM total and max clocks from IORegistry properties
+			CFMutableDictionaryRef cf_props = nullptr;
+			if (IORegistryEntryCreateCFProperties(gpu_service, &cf_props, kCFAllocatorDefault, kNilOptions) == kIOReturnSuccess and cf_props) {
+				//? Max clocks from GPUConfigurationVariable
+				CFDictionaryRef gpu_conf = (CFDictionaryRef)CFDictionaryGetValue(cf_props, CFSTR("GPUConfigurationVariable"));
+				if (gpu_conf) {
+					long long sys_clk = cf_dict_get_int(gpu_conf, CFSTR("SysClkFreq"));
+					if (sys_clk > 0) {
+						// SysClkFreq is in units of 10 KHz → divide by 100 for MHz
+						gpus[gpu_index_offset].gpu_clock_speed = static_cast<unsigned int>(sys_clk / 100);
+					}
+				}
+
+				//? Compute VRAM total from PerformanceStatistics
+				CFDictionaryRef perf = (CFDictionaryRef)CFDictionaryGetValue(cf_props, CFSTR("PerformanceStatistics"));
+				if (perf) {
+					long long vu = cf_dict_get_int(perf, CFSTR("inUseVidMemoryBytes"));
+					long long vf = cf_dict_get_int(perf, CFSTR("vramFreeBytes"));
+					long long orphR = cf_dict_get_int(perf, CFSTR("orphanedReusableVidMemoryBytes"));
+					long long orphN = cf_dict_get_int(perf, CFSTR("orphanedNonReusableVidMemoryBytes"));
+					if (vu >= 0 and vf >= 0) {
+						long long total = vu + vf;
+						if (orphR > 0) total += orphR;
+						if (orphN > 0) total += orphN;
+						gpus[gpu_index_offset].mem_total = total;
+					}
+				}
+				CFRelease(cf_props);
+			}
+
+			//? Set power max (W6900X = 300W, W6800 = 250W, fallback 350W)
+			string name = get_gpu_name();
+			if (name.find("W6900X") != string::npos) gpus[gpu_index_offset].pwr_max_usage = 300000;
+			else if (name.find("W6800") != string::npos) gpus[gpu_index_offset].pwr_max_usage = 250000;
+			else if (name.find("W5700") != string::npos) gpus[gpu_index_offset].pwr_max_usage = 205000;
+			else gpus[gpu_index_offset].pwr_max_usage = 350000;
+			gpu_pwr_total_max += gpus[gpu_index_offset].pwr_max_usage;
+
+			gpus[gpu_index_offset].temp_max = 110;
+
+			//? Supported functions
+			gpus[gpu_index_offset].supported_functions = {
+				.gpu_utilization = true,
+				.mem_utilization = true,
+				.gpu_clock = true,
+				.mem_clock = true,
+				.pwr_usage = true,
+				.pwr_state = false,
+				.temp_info = true,
+				.mem_total = true,
+				.mem_used = true,
+				.pcie_txrx = false,
+				.encoder_utilization = false,
+				.decoder_utilization = false
+			};
+
+			initialized = true;
+			Logger::info("AppleAMD GPU: Initialized {}", get_gpu_name());
+
+			//? Run initial collect
+			collect(gpus.data() + gpu_index_offset);
+
+			return true;
+		}
+
+		bool shutdown() {
+			if (not initialized) return false;
+			if (gpu_service) { IOObjectRelease(gpu_service); gpu_service = 0; }
+			initialized = false;
+			return true;
+		}
+
+		bool collect(gpu_info* gpu) {
+			if (not initialized or not gpu_service) return false;
+
+			CFMutableDictionaryRef cf_props = nullptr;
+			if (IORegistryEntryCreateCFProperties(gpu_service, &cf_props, kCFAllocatorDefault, kNilOptions) != kIOReturnSuccess)
+				return false;
+			if (not cf_props) return false;
+
+			CFDictionaryRef perf = (CFDictionaryRef)CFDictionaryGetValue(cf_props, CFSTR("PerformanceStatistics"));
+			if (not perf) {
+				CFRelease(cf_props);
+				return false;
+			}
+
+			//? GPU utilization
+			long long util = cf_dict_get_int(perf, CFSTR("Device Utilization %"));
+			if (util >= 0) {
+				util = clamp(util, 0ll, 100ll);
+				gpu->gpu_percent.at("gpu-totals").push_back(util);
+				gpu->mem_utilization_percent.push_back(util);
+			}
+
+			//? Temperature
+			long long temp = cf_dict_get_int(perf, CFSTR("Temperature(C)"));
+			if (temp > 0 and temp < 150)
+				gpu->temp.push_back(temp);
+
+			//? Power (reported in Watts, convert to mW)
+			long long power_w = cf_dict_get_int(perf, CFSTR("Total Power(W)"));
+			if (power_w >= 0) {
+				gpu->pwr_usage = power_w * 1000;
+				if (gpu->pwr_usage > gpu->pwr_max_usage)
+					gpu->pwr_max_usage = gpu->pwr_usage;
+				gpu->gpu_percent.at("gpu-pwr-totals").push_back(
+					clamp(gpu->pwr_usage * 100 / gpu->pwr_max_usage, 0ll, 100ll));
+			}
+
+			//? GPU clock speed (MHz)
+			long long gclk = cf_dict_get_int(perf, CFSTR("Core Clock(MHz)"));
+			if (gclk >= 0)
+				gpu->gpu_clock_speed = static_cast<unsigned int>(gclk);
+
+			//? Memory clock speed (MHz)
+			long long mclk = cf_dict_get_int(perf, CFSTR("Memory Clock(MHz)"));
+			if (mclk >= 0)
+				gpu->mem_clock_speed = mclk;
+
+			//? VRAM usage
+			long long vu = cf_dict_get_int(perf, CFSTR("inUseVidMemoryBytes"));
+			long long vf = cf_dict_get_int(perf, CFSTR("vramFreeBytes"));
+			if (vu >= 0) {
+				gpu->mem_used = vu;
+				//? Recompute total from current data
+				if (vf >= 0) {
+					long long orphR = cf_dict_get_int(perf, CFSTR("orphanedReusableVidMemoryBytes"));
+					long long orphN = cf_dict_get_int(perf, CFSTR("orphanedNonReusableVidMemoryBytes"));
+					long long total = vu + vf;
+					if (orphR > 0) total += orphR;
+					if (orphN > 0) total += orphN;
+					gpu->mem_total = total;
+				}
+				if (gpu->mem_total > 0) {
+					auto used_pct = clamp(gpu->mem_used * 100 / gpu->mem_total, 0ll, 100ll);
+					gpu->gpu_percent.at("gpu-vram-totals").push_back(used_pct);
+				}
+			}
+
+			CFRelease(cf_props);
+			return true;
+		}
+	} // namespace AppleAMD
+
+	//? Collect data from all GPU backends
 	auto collect(bool no_update) -> vector<gpu_info>& {
 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
 
-		AppleSilicon::collect<0>(gpus.data());
+		if (AppleSilicon::initialized)
+			AppleSilicon::collect<0>(gpus.data());
+
+		if (AppleAMD::initialized)
+			AppleAMD::collect(gpus.data() + AppleAMD::gpu_index_offset);
 
 		//* Calculate averages
 		long long avg = 0;
@@ -707,8 +942,12 @@ namespace Shared {
 		//? Init for namespace Gpu
 	#ifdef GPU_SUPPORT
 		auto shown_gpus = Config::getS("shown_gpus");
-		if (shown_gpus.contains("apple")) {
+		if (shown_gpus.empty() or shown_gpus.contains("apple")) {
 			Gpu::AppleSilicon::init();
+		}
+		//? Also try AMD discrete GPU (works alongside or instead of Apple Silicon)
+		if (shown_gpus.empty() or shown_gpus.contains("amd") or shown_gpus.contains("apple")) {
+			Gpu::AppleAMD::init();
 		}
 
 		if (not Gpu::gpu_names.empty()) {
