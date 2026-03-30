@@ -341,6 +341,10 @@ See [GPU compatibility](#gpu-compatibility) section for more about compiling wit
 
 ![Screenshot 1](Img/normal.png)
 
+#### macOS with GPU reporting
+
+![Screenshot 1](Img/macOS_GPU.png)
+
 #### Main UI in TTY mode
 
 ![Screenshot 2](Img/tty.png)
