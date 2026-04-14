@@ -102,10 +102,12 @@ namespace Cpu {
 		virtual ~SMCConnection();
 
 		long long getTemp(int core);
+		double getCpuPower();
 
 	   private:
 		kern_return_t SMCReadKey(UInt32Char_t key, SMCVal_t *val);
 		long long getSMCTemp(char *key);
+		double getSMCFloat(const char *key);
 		kern_return_t SMCCall(int index, SMCKeyData_t *inputStructure, SMCKeyData_t *outputStructure);
 
 		io_connect_t conn;

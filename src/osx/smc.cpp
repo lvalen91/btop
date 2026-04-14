@@ -69,6 +69,25 @@ namespace Cpu {
 		IOServiceClose(conn);
 	}
 
+	double SMCConnection::getSMCFloat(const char *key) {
+		SMCVal_t val;
+		UInt32Char_t k;
+		memcpy(k, key, 4);
+		k[4] = 0;
+		if (SMCReadKey(k, &val) == kIOReturnSuccess and val.dataSize >= 4) {
+			float f;
+			memcpy(&f, val.bytes, sizeof(f));
+			return static_cast<double>(f);
+		}
+		return -1.0;
+	}
+
+	// PC0R: CPU package power in Watts (flt, 4 bytes). Present on Xeon Mac Pro
+	// and iMac Pro; also exposed on many consumer Intel Macs.
+	double SMCConnection::getCpuPower() {
+		return getSMCFloat("PC0R");
+	}
+
 	long long SMCConnection::getSMCTemp(char *key) {
 		SMCVal_t val;
 		kern_return_t result;
@@ -87,24 +106,26 @@ namespace Cpu {
 
 	// core means physical core in SMC, while in core map it's cpu threads :-/ Only an issue on hackintosh?
 	// this means we can only get the T per physical core
-	// another issue with the SMC API is that the key is always 4 chars -> what with systems with more than 9 physical cores?
-	// no Mac models with more than 18 threads are released, so no problem so far
-	// according to VirtualSMC docs (hackintosh fake SMC) the enumeration follows with alphabetic chars - not implemented yet here (nor in VirtualSMC)
+	// SMC keys are 4 chars, so the index uses a single char: 0-9 then A-Z, matching VirtualSMC's enumeration.
+	// This supports up to 36 physical cores (enough for the 28-core Xeon Mac Pro 2019).
 	long long SMCConnection::getTemp(int core) {
 		char key[] = SMC_KEY_CPU_TEMP;
-		if (core >= 0) {
-			if ((size_t)core > MaxIndexCount) {
-				return -1;
-			}
-			snprintf(key, 5, "TC%1cc", KeyIndexes[core]);
+		if (core < 0) {
+			return getSMCTemp(key);
 		}
+		if ((size_t)core >= MaxIndexCount) {
+			return -1;
+		}
+		snprintf(key, 5, "TC%1cc", KeyIndexes[core]);
 		long long result = getSMCTemp(key);
-		if (result == -1) {
-			// try again with C
-			snprintf(key, 5, "TC%1dC", KeyIndexes[core]);
-			result = getSMCTemp(key);
-		}
-		return result;
+		if (result != -1) return result;
+		snprintf(key, 5, "TC%1cC", KeyIndexes[core]);
+		result = getSMCTemp(key);
+		if (result != -1) return result;
+		// Xeon Mac Pro (MacPro7,1) / iMac Pro: no per-physical-core keys exist.
+		// Fall back to TCXc, the single "hot core" die sensor these SMCs expose.
+		snprintf(key, 5, "TCXc");
+		return getSMCTemp(key);
 	}
 
 	kern_return_t SMCConnection::SMCReadKey(UInt32Char_t key, SMCVal_t *val) {

@@ -1034,6 +1034,10 @@ namespace Cpu {
 								core_offset = 1;
 							}
 						}
+						if (smcCon.getCpuPower() >= 0.0) {
+							Logger::debug("intel CPU power sensor (PC0R) available");
+							supports_watts = true;
+						}
 					} else {
 						Logger::debug("no intel sensors found");
 						got_sensors = false;
@@ -1073,6 +1077,10 @@ namespace Cpu {
 						if (current_cpu.temp.at(core + 1).size() > 20)
 							current_cpu.temp.at(core + 1).pop_front();
 					}
+				}
+				if (supports_watts) {
+					double w = smcCon.getCpuPower();
+					if (w >= 0.0) current_cpu.usage_watts = static_cast<float>(w);
 				}
 			}
 		} catch (std::runtime_error &e) {
